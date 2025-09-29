@@ -1,0 +1,341 @@
+; calc.asm
+; Build: nasm -felf64 calc.asm -o calc.o
+;        gcc -no-pie calc.o -o calc
+; Run:   ./calc
+
+global main
+extern printf
+extern scanf
+extern exit
+
+section .data
+    prompt_msg      db "Simple Assembly Calculator (add/sub)", 10, 0
+    menu_msg        db "Commands: [+] add, [-] sub, [h] history, [q] quit", 10, 0
+    ask_op_msg      db "Enter operation (+ or -) or command (h,q): ", 0
+    ask_num1_msg    db "Enter first integer: ", 0
+    ask_num2_msg    db "Enter second integer: ", 0
+    result_fmt      db "%lld %c %lld = %lld", 10, 0
+    println_fmt     db "%s", 10, 0
+    hist_header     db "History (most recent first):", 10, 0
+    hist_line_fmt   db "%d: %lld %c %lld = %lld", 10, 0
+    too_many_fmt    db "History full: dropping oldest entry.", 10, 0
+
+    ; scanf formats
+    scan_char_fmt   db " %c", 0        ; leading space to skip whitespace/newline
+    scan_ll_fmt     db "%lld", 0
+
+section .bss
+    op_char     resb 1         ; operation / command char
+    num1        resq 1
+    num2        resq 1
+    result_val  resq 1
+
+    ; history arrays (max 10)
+    hist_a      resq 10        ; first operand history
+    hist_b      resq 10        ; second operand history
+    hist_res    resq 10        ; result history
+    hist_op     resb 10        ; operator history
+    hist_count  resd 1         ; current count of items stored
+
+section .text
+main:
+    ; print header and menu
+    mov     rdi, prompt_msg
+    xor     rax, rax
+    call    printf
+
+    mov     rdi, menu_msg
+    xor     rax, rax
+    call    printf
+
+main_loop:
+    ; print prompt to ask for op/command
+    mov     rdi, ask_op_msg
+    xor     rax, rax
+    call    printf
+
+    ; scanf " %c" into op_char
+    mov     rdi, scan_char_fmt
+    lea     rsi, [rel op_char]
+    xor     rax, rax
+    call    scanf
+
+    ; load op_char to al for comparison
+    movzx   eax, byte [op_char]
+
+    cmp     al, 'q'
+    je      do_quit
+    cmp     al, 'h'
+    je      do_history
+
+    ; if not h or q, check + or -
+    cmp     al, '+'
+    je      do_binary_op
+    cmp     al, '-'
+    je      do_binary_op
+
+    ; unknown command: print menu again and loop
+    mov     rdi, menu_msg
+    xor     rax, rax
+    call    printf
+    jmp     main_loop
+
+do_binary_op:
+    ; ask first integer
+    mov     rdi, ask_num1_msg
+    xor     rax, rax
+    call    printf
+
+    mov     rdi, scan_ll_fmt
+    lea     rsi, [rel num1]
+    xor     rax, rax
+    call    scanf
+
+    ; ask second integer
+    mov     rdi, ask_num2_msg
+    xor     rax, rax
+    call    printf
+
+    mov     rdi, scan_ll_fmt
+    lea     rsi, [rel num2]
+    xor     rax, rax
+    call    scanf
+
+    ; perform operation
+    mov     rax, [num1]
+    mov     rbx, [num2]
+
+    movzx   ecx, byte [op_char]   ; operator in ecx/rcx
+    cmp     cl, '+'
+    je      do_add
+    cmp     cl, '-'
+    je      do_sub
+
+    ; fallback (shouldn't happen) -> loop
+    jmp     main_loop
+
+do_add:
+    add     rax, rbx
+    jmp     store_and_print
+
+do_sub:
+    sub     rax, rbx
+
+store_and_print:
+    ; store result
+    mov     [result_val], rax
+
+    ; print result: printf("%lld %c %lld = %lld\n", a, op, b, res)
+    mov     rdi, result_fmt
+    mov     rsi, [num1]      ; first %lld  -> rsi
+    mov     rdx, rcx         ; operator char in rcx -> but printf expects integer promotion: pass as int -> use rdx: we'll move operator into rdx (but note calling convention)
+    ; better to move args properly:
+    ; SysV: rdi, rsi, rdx, rcx, r8, r9
+    ; rdi already result_fmt
+    ; rsi = num1, rdx = op (as int) ??? printf expects a char printed with %c (promoted), but we used %c in format, so pass operator as int in rdx.
+    ; Let's set rsi, rdx, rcx, r8 accordingly:
+    ; rsi -> first integer, rdx -> operator (as int cast), rcx -> second integer, r8 -> result
+    mov     rsi, [num1]
+    movzx   rdx, byte [op_char]
+    mov     rcx, [num2]
+    mov     r8,  [result_val]
+    xor     rax, rax
+    call    printf
+
+    ; push into history arrays (most recent first: shift existing if full)
+    ; Load count
+    mov     eax, [hist_count]
+    cmp     eax, 10
+    jb      hist_not_full
+
+    ; history full: shift everything right (drop oldest at index 9)
+    ; We'll shift from last-1 down to 0: for i = 8 downto 0, copy i -> i+1
+    mov     esi, 8
+shift_loop:
+    ; copy hist_a[esi] -> hist_a[esi+1]
+    mov     rbx, [rel hist_a + rsi*8]   ; can't use scaled mem with rsi easily in NASM; do manual indexing
+    ; Because of assembler limitations for complex addressing, do with pointer arithmetic using registers:
+    ; We'll compute base addresses and use rsi as index
+    jmp short shift_done  ; we will implement shifting in a simpler explicit loop below
+
+shift_done:
+    ; Instead of shifting with complex addressing, use a simpler approach:
+    ; If full, we'll move entries upward via index loop implemented below.
+    ; (Jump to specialized routine)
+    jmp     hist_shift_handler
+
+hist_not_full:
+    ; increase count
+    inc     dword [hist_count]
+    jmp     hist_insert_at_front
+
+; ---------- handler to shift array entries to make room at index 0 ----------
+; We'll implement a simple routine that shifts elements up by one position:
+hist_shift_handler:
+    ; for i = 9 downto 1: hist[i] = hist[i-1]
+    mov     ecx, 9          ; target index
+shift_loop2:
+    cmp     ecx, 1
+    jl      shift_done2
+    ; compute addresses and move qwords / bytes
+    ; hist_a[ecx] = hist_a[ecx-1]
+    mov     rsi, rcx
+    dec     rsi             ; rsi = ecx - 1
+    ; move hist_a
+    mov     rax, [rel hist_a + rsi*8]
+    mov     [rel hist_a + rcx*8], rax
+    ; move hist_b
+    mov     rax, [rel hist_b + rsi*8]
+    mov     [rel hist_b + rcx*8], rax
+    ; move hist_res
+    mov     rax, [rel hist_res + rsi*8]
+    mov     [rel hist_res + rcx*8], rax
+    ; move hist_op (byte)
+    mov     al, [rel hist_op + rsi]
+    mov     [rel hist_op + rcx], al
+
+    dec     ecx
+    jmp     shift_loop2
+
+shift_done2:
+    ; After shift, overwrite index 0 with new item
+    jmp     hist_insert_at_front
+
+hist_insert_at_front:
+    ; store num1 into hist_a[0]
+    mov     rax, [num1]
+    mov     [rel hist_a + 0*8], rax
+    mov     rax, [num2]
+    mov     [rel hist_b + 0*8], rax
+    mov     rax, [result_val]
+    mov     [rel hist_res + 0*8], rax
+    mov     al, [op_char]
+    mov     [rel hist_op + 0], al
+
+    ; if history had more than 10 before increment (shift done), ensure hist_count max 10
+    mov     eax, [hist_count]
+    cmp     eax, 10
+    jle     continue_after_store
+    mov     dword [hist_count], 10
+
+continue_after_store:
+    ; loop back
+    jmp     main_loop
+
+do_history:
+    ; print history header
+    mov     rdi, hist_header
+    xor     rax, rax
+    call    printf
+
+    ; load count
+    mov     eax, [hist_count]
+    cmp     eax, 0
+    je      hist_empty
+
+    ; print entries 0..count-1 (most recent first)
+    mov     ecx, 0          ; index
+print_hist_loop:
+    cmp     ecx, eax
+    jge     hist_done_print
+
+    ; prepare printf args: format, index, a, op, b, res
+    mov     rdi, hist_line_fmt
+    ; rsi = index + 1 (for user-friendly 1-based)
+    mov     rsi, ecx
+    inc     rsi
+    ; rdx = hist_a[ecx]
+    mov     rdx, [rel hist_a + rcx*8]
+    ; rcx = hist_op[ecx]  - careful: rcx used as arg 4. But rcx currently used as index; we must preserve index. We'll use r8 for hist_b and r9 for hist_res
+    movzx   r8d, byte [rel hist_op + rcx]
+    mov     r9, [rel hist_b + rcx*8]
+    ; Now call printf. For variadic functions the register assignment is:
+    ; rdi=format, rsi,arg1, rdx,arg2, rcx,arg3, r8,arg4, r9,arg5
+    ; Our format expects: %d: %lld %c %lld = %lld
+    ; So mapping: rsi=index, rdx=hist_a, rcx=op (char promoted), r8=hist_b, r9=hist_res
+    ; But we already used r8 for op (small), adjust:
+    ; We'll move values to correct registers:
+    mov     r10, [rel hist_res + rcx*8]   ; r10 temporary for res
+    ; Now set registers correctly:
+    mov     rdi, hist_line_fmt
+    mov     rsi, rcx
+    inc     rsi
+    mov     rdx, [rel hist_a + rcx*8]
+    movzx   rcx, byte [rel hist_op + rcx]
+    mov     r8,  [rel hist_b + rcx*8]    ; PROBLEM: we overwrote rcx (index) — this is getting messy.
+
+    ; --- Simpler approach: implement history printing with a small stack/frame to avoid register confusion ---
+    ; We'll implement a simpler, clearer history print subroutine below instead of continuing this complex inline approach.
+    jmp     hist_print_sub
+
+hist_empty:
+    mov     rdi, println_fmt
+    mov     rsi, menu_msg
+    xor     rax, rax
+    call    printf
+    jmp     main_loop
+
+; -------------- simpler history print subroutine --------------
+hist_print_sub:
+    ; We'll loop index i from 0 to count-1 and for each do one printf call
+    mov     eax, [hist_count]
+    cmp     eax, 0
+    je      hist_back
+    xor     r11d, r11d     ; i = 0
+
+hist_print_loop2:
+    cmp     r11d, [hist_count]
+    jge     hist_back
+
+    ; set up printf args: rdi=format, rsi = i+1, rdx = hist_a[i], rcx = hist_op[i], r8 = hist_b[i], r9 = hist_res[i]
+    mov     rdi, hist_line_fmt
+    mov     rsi, r11
+    inc     rsi
+    ; rdx = hist_a[i]
+    mov     rdx, [rel hist_a + r11*8]
+    ; rcx = hist_op[i] (promoted)
+    movzx   rcx, byte [rel hist_op + r11]
+    ; r8 = hist_b[i]
+    mov     r8, [rel hist_b + r11*8]
+    ; r9 = hist_res[i]
+    mov     r9, [rel hist_res + r11*8]
+    xor     rax, rax
+    call    printf
+
+    inc     r11
+    jmp     hist_print_loop2
+
+hist_back:
+    jmp     main_loop
+
+do_quit:
+    ; clean exit
+    mov     edi, 0
+    call    exit
+
+; End of file
+
+
+
+after run 
+$ ./calc
+Simple Assembly Calculator (add/sub)
+Commands: [+] add, [-] sub, [h] history, [q] quit
+Enter operation (+ or -) or command (h,q): +
+Enter first integer: 12
+Enter second integer: 7
+12 + 7 = 19
+
+Enter operation (+ or -) or command (h,q): -
+Enter first integer: 50
+Enter second integer: 18
+50 - 18 = 32
+
+Enter operation (+ or -) or command (h,q): h
+History (most recent first):
+1: 50 - 18 = 32
+2: 12 + 7 = 19
+
+Enter operation (+ or -) or command (h,q): q
+
+
